@@ -1,0 +1,9 @@
+# === IDE - PyCharm ===
+.idea/
+
+# === Claude CLI ===
+.claude/
+CLAUDE.md
+
+# === OpenSpec ===
+openspec/
