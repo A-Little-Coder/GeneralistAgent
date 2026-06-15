@@ -1,90 +1,53 @@
 """ChatBI 配置加载模块。
 
-基于 `pydantic-settings` 实现配置项的统一加载，覆盖优先级：
+`.env` 已在 `chatbi/__init__.py` 顶部由 `python-dotenv` 加载到 `os.environ`，
+本模块只是把环境变量按业务字段分组、提供默认值，并做一次 lru_cache 单例。
 
-    环境变量 > 项目根目录 `.env` 文件 > 字段默认值
-
-字段名按 `pydantic-settings` 默认大小写不敏感的方式自动映射环境变量，
-例如 `qwen_api_key` 字段会从 `QWEN_API_KEY` 环境变量读取。
-
-对外暴露：
-    - `Settings`：配置数据类，承载全部配置字段；
-    - `get_settings()`：基于 `functools.lru_cache` 的单例工厂。
-      单元测试中如需重置缓存，可调用 `get_settings.cache_clear()`。
+优先级：环境变量 > `.env` > 这里写死的默认值。
 """
 
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from functools import lru_cache
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
+@dataclass(frozen=True)
+class Settings:
+    """ChatBI 全局运行时配置。"""
 
-class Settings(BaseSettings):
-    """ChatBI 全局运行时配置。
+    # LangSmith
+    langsmith_api_key: str
+    langchain_project: str
 
-    字段说明见各 Field 的 `description`。新增字段时请同步更新 `.env.example`
-    与文档；若字段含敏感信息，请勿写入默认值。
-    """
+    # 运行环境
+    chatbi_env: str
 
-    # === LangSmith 可观测性 ===
-    langsmith_api_key: str = Field(
-        default="",
-        description="LangSmith API Key，用于 Tracer 上报；空字符串表示禁用上报。",
-    )
-    langchain_project: str = Field(
-        default="chatbi-dev",
-        description="LangSmith 项目名（同一环境的 trace 会聚合到该项目下）。",
-    )
+    # Qwen / DashScope（OpenAI 兼容协议）
+    qwen_api_key: str
+    qwen_base_url: str
+    qwen_model: str
 
-    # === 运行环境标识 ===
-    chatbi_env: str = Field(
-        default="dev",
-        description="部署环境标识，取值范围：dev / staging / prod。",
-    )
-
-    # === LLM 接入（Qwen / DashScope，OpenAI 兼容协议）===
-    qwen_api_key: str = Field(
-        default="",
-        description="Qwen / DashScope API Key（OpenAI 兼容接口）。",
-    )
-    qwen_base_url: str = Field(
-        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        description="Qwen / DashScope OpenAI 兼容接口的 Base URL。",
-    )
-    qwen_model: str = Field(
-        default="qwen-plus",
-        description="默认使用的 Qwen 模型名。",
-    )
-
-    # === 日志 ===
-    log_level: str = Field(
-        default="INFO",
-        description="root logger 日志级别，常见取值：DEBUG / INFO / WARNING / ERROR。",
-    )
-
-    # pydantic-settings 配置：
-    #   - env_file：项目根目录 `.env`；
-    #   - case_sensitive=False：允许大小写自动匹配；
-    #   - extra="ignore"：忽略 .env 中未在本类声明的多余键（如 BGE_M3_MODEL_PATH），避免启动失败。
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
-        extra="ignore",
-    )
+    # 日志
+    log_level: str
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """获取全局 `Settings` 单例。
+    """读取一次环境变量并返回 Settings 单例。
 
-    使用 `functools.lru_cache` 保证进程内仅实例化一次，避免重复读取 `.env`。
-    单元测试若需要修改环境变量后重新加载，请显式调用：
-
-        >>> get_settings.cache_clear()
-        >>> get_settings()  # 触发一次新的实例化
+    单测改完环境变量后请显式 ``get_settings.cache_clear()``。
     """
-
-    return Settings()
+    return Settings(
+        langsmith_api_key=os.getenv("LANGSMITH_API_KEY", ""),
+        langchain_project=os.getenv("LANGCHAIN_PROJECT", "chatbi-dev"),
+        chatbi_env=os.getenv("CHATBI_ENV", "dev"),
+        qwen_api_key=os.getenv("QWEN_API_KEY", ""),
+        qwen_base_url=os.getenv(
+            "QWEN_BASE_URL",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ),
+        qwen_model=os.getenv("QWEN_MODEL", "qwen-plus"),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+    )
