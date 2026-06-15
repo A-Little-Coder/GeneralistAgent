@@ -6,4 +6,7 @@
 CLAUDE.md
 
 # === OpenSpec ===
-openspec/
+
+
+# Environment variables
+.env
