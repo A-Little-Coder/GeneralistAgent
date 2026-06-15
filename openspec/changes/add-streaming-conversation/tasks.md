@@ -61,17 +61,54 @@
 - [ ] 9.3 注入 trace context middleware（每请求设置 user_id/conv_id/plan_run_id）
 - [ ] 9.4 README 章节：《SSE 协议》《前端集成示例》
 
-## 10. 端到端集成测试
+## 10. 统一错误响应
 
-- [ ] 10.1 完整问答（无反问）
-- [ ] 10.2 反问 slot_fill 续跑
-- [ ] 10.3 反问 replan 续跑
-- [ ] 10.4 限流 429
-- [ ] 10.5 客户端断开取消
-- [ ] 10.6 离线续跑
+- [ ] 10.1 在 `chatbi/conversation/errors.py` 定义错误码枚举（kebab-case，含 `rate_limited`/`invalid_input`/`conversation_not_found`/`plan_run_not_found`/`not_ready`/`internal_error` 等）
+- [ ] 10.2 实现 `ChatBIException` 基类（含 code / message / status_code / plan_run_id）
+- [ ] 10.3 注册 FastAPI `exception_handler` 处理：`ChatBIException` / `HTTPException` / `Exception`，统一输出 `{"error":{"code","message","plan_run_id"}}`
+- [ ] 10.4 单元测试：4xx/5xx/未捕获异常的响应体 schema
+- [ ] 10.5 注意：不引入 X-Request-Id 中间件；body 中 plan_run_id 来源于 `TraceContext`（缺失为空串）
 
-## 11. 验收
+## 11. http-surface 接口实现
 
-- [ ] 11.1 全部测试通过
-- [ ] 11.2 LangSmith 中可看到完整对话 trace（含反问、续跑、限流事件）
-- [ ] 11.3 README 协议示例可被前端验证
+- [ ] 11.1 `GET /api/capabilities`：从 `SkillRegistry.summary_table()` 读取，返回 `{"capabilities":[...]}`
+- [ ] 11.2 `GET /api/ready`：依次检查 Redis ping / SQLite / LLM 工厂 / SkillRegistry，全过返回 200，否则 503 + 统一错误格式
+- [ ] 11.3 `POST /api/feedback`：写入 `mem:conv:{cid}:feedback` 列表，并给 LangSmith 对应 plan_run trace 加 tag `feedback=<rating>`
+- [ ] 11.4 `GET /api/conversations`：列出 user 的对话，按 `last_active_at` 倒序，支持 `limit`/`cursor` 分页
+- [ ] 11.5 `GET /api/conversations/{cid}/messages`：分页拉历史消息，`limit` 默认 50 / 最大 200，`before` 游标
+- [ ] 11.6 `DELETE /api/conversations/{cid}`：调 `SessionMemoryStore.clear` 删除全部 `mem:conv:{cid}:*` key
+- [ ] 11.7 单元测试：每个接口的 200 / 4xx / 5xx 路径
+- [ ] 11.8 OpenAPI：FastAPI 自动生成；`/docs` 在 `CHATBI_ENV=dev` 时开启，prod 关闭
+
+## 12. 对话标题 + 元数据
+
+- [ ] 12.1 在 `add-memory-persistence` 提供的 `SessionMemoryStore` 之上添加 `ConversationStore`（同包/同模块均可），暴露 `ensure_title(cid, first_query)`、`list_for_user(uid, limit, cursor)`、`get_meta(cid)`
+- [ ] 12.2 标题截断逻辑：按字符数（`len()`）截 30，超出加 `…`
+- [ ] 12.3 plan_run 完成时（在 stream_endpoint 收尾处）调用 `ensure_title`
+- [ ] 12.4 `last_active_at` 在每次 plan_run 完成时更新
+- [ ] 12.5 单元测试：短/长 query / 后续轮不覆盖
+
+## 13. feedback 在 LangSmith 的关联
+
+- [ ] 13.1 用 LangSmith client 找到 root run by `plan_run_id`，加 tag `feedback=<rating>` 与 metadata `comment`
+- [ ] 13.2 失败容忍：LangSmith 不可达时仍写入本地反馈（不阻断接口）
+
+## 14. 端到端集成测试
+
+- [ ] 14.1 完整问答（无反问）
+- [ ] 14.2 反问 slot_fill 续跑
+- [ ] 14.3 反问 replan 续跑
+- [ ] 14.4 限流 429
+- [ ] 14.5 客户端断开取消
+- [ ] 14.6 离线续跑
+- [ ] 14.7 capabilities / ready / feedback 三个接口的 200 路径
+- [ ] 14.8 conversations CRUD：列表 → 历史 → 删除
+- [ ] 14.9 标题自动生成：首条 query 完成后 title 正确
+- [ ] 14.10 错误响应统一性：故意触发 4xx/5xx 校验 schema
+
+## 15. 验收
+
+- [ ] 15.1 全部测试通过
+- [ ] 15.2 LangSmith 中可看到完整对话 trace（含反问、续跑、限流事件、feedback tag）
+- [ ] 15.3 README 协议示例可被前端验证
+- [ ] 15.4 `/docs`（仅 dev）展示完整 OpenAPI，所有 http-surface 接口均含 schema
