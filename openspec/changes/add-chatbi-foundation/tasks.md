@@ -10,8 +10,8 @@
 ## 2. Python 包骨架
 
 - [x] 2.1 创建 `chatbi/__init__.py`（含 `__version__`）
-- [x] 2.2 创建子包 `chatbi/conversation/`、`chatbi/orchestrator/`、`chatbi/capabilities/teammates/`、`chatbi/capabilities/common_tools/`、`chatbi/infra/{memory,persistence,skill_registry,ask_back,communication}/`、`chatbi/observability/`、`chatbi/cli/`、`chatbi/server/`，各自带 `__init__.py`
-- [x] 2.3 创建顶层占位目录 `skills/`（含 `README.md`）、`evals/`（含 `README.md`）、`learn/`、`tests/`
+- [x] 2.2 创建本 change 实际要实装的子包：`chatbi/infra/{config,logging}/`、`chatbi/observability/`、`chatbi/cli/`、`chatbi/server/`，各自带 `__init__.py`（其余子包由后续 change 按需创建，不预先占位）
+- [x] 2.3 创建顶层 `tests/` 目录（`skills/`、`evals/`、`learn/` 由对应 change 按需创建）
 - [x] 2.4 在 `tests/__init__.py` 与 `tests/conftest.py` 写好 pytest 基础配置（asyncio mode、tmp_path 共享 fixture）
 
 ## 3. 配置加载

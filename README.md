@@ -17,23 +17,19 @@ ChatBI Agent 把原先散落在多处的 Agent 能力（知识问答、NL2SQL、
 ```
 GeneralistAgent/
 ├── chatbi/
-│   ├── conversation/     # 会话层
-│   ├── orchestrator/     # 中控 Agent 层
-│   ├── capabilities/     # 能力层（teammates/, common_tools/）
-│   ├── infra/            # 基础设施
-│   ├── observability/    # 监控 / LangSmith
+│   ├── infra/            # 基础设施（已实装：config/, logging/）
+│   ├── observability/    # 监控 / LangSmith / LLM 工厂
 │   ├── cli/              # CLI 入口
 │   └── server/           # FastAPI 入口
-├── skills/               # SKILL 描述文件目录
-├── evals/                # 测评数据集与脚本
-├── learn/                # 教学 demo
 ├── tests/                # 单元 / 集成测试
-├── scripts/              # 辅助脚本
+├── scripts/              # 安装与校验脚本
 ├── .env.example
 ├── pyproject.toml
 ├── requirements.txt
 └── openspec/             # OpenSpec 变更与规约
 ```
+
+> 后续的 change 会按需新增 `chatbi/conversation/`、`chatbi/orchestrator/`、`chatbi/capabilities/`、`skills/`、`evals/` 等目录，本 change 不预先占位。
 
 ## 安装
 
