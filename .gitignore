@@ -2,8 +2,8 @@
 .idea/
 
 # === Data ===
-.remote/
-.skills/
+remote/
+skills/
 
 # === Claude CLI ===
 .claude/
