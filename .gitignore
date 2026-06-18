@@ -1,6 +1,10 @@
 # === IDE - PyCharm ===
 .idea/
 
+# === Data ===
+.remote/
+.skills/
+
 # === Claude CLI ===
 .claude/
 CLAUDE.md
