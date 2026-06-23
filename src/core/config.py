@@ -3,11 +3,15 @@
 """
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
+
+from src.orchestration.proxy_tools import ProxyServiceConfig
 
 
 @dataclass
@@ -31,11 +35,67 @@ class Config:
     # 项目路径
     skills_dir: str = field(default="")       # 本地 skills/ 目录
     remote_db_dir: str = field(default="")    # 远程数据库目录
+    teams_root: str = field(default="")       # 团队共享 TaskList 根目录（项目内，不跨项目共用）
+
+    # 外部代理服务配置（从 PROXY_<NAME>_* 环境变量解析）
+    proxy_services: list = field(default_factory=list)  # list[ProxyServiceConfig]
 
     @property
     def model_spec(self) -> str:
         """返回 init_chat_model 可识别的 provider:model 格式。"""
         return f"openai:{self.model_name}"
+
+    def get_proxy_service(self, name: str) -> Optional[ProxyServiceConfig]:
+        """按服务名查找代理服务配置，找不到返回 None。"""
+        for svc in self.proxy_services:
+            if svc.name == name:
+                return svc
+        return None
+
+
+# .env 中代理服务变量的正则：PROXY_<NAME>_<FIELD>
+_PROXY_ENV_RE = re.compile(r"^PROXY_([A-Z0-9]+)_([A-Z_]+)$")
+
+
+def _parse_proxy_services_from_env() -> list[ProxyServiceConfig]:
+    """从 os.environ 解析所有 `PROXY_<NAME>_*` 配置项，聚合为 ProxyServiceConfig 列表。
+
+    支持的字段（不区分大小写）：
+      ACCESS_KIND / BASE_URL / AUTH_HEADER / TIMEOUT / MCP_COMMAND / SKILL_NAME
+
+    必须 ACCESS_KIND 非空才会被注册；其他字段缺省走 dataclass 默认值。
+    """
+    buckets: dict[str, dict[str, str]] = {}
+    for key, value in os.environ.items():
+        m = _PROXY_ENV_RE.match(key)
+        if not m:
+            continue
+        name = m.group(1).lower()
+        field_name = m.group(2).lower()
+        buckets.setdefault(name, {})[field_name] = value
+
+    services: list[ProxyServiceConfig] = []
+    for name, fields in buckets.items():
+        access_kind = fields.get("access_kind", "").strip().lower()
+        if not access_kind:
+            continue  # 没声明访问方式 → 跳过
+
+        timeout_str = fields.get("timeout", "30").strip()
+        try:
+            timeout = int(timeout_str)
+        except ValueError:
+            timeout = 30
+
+        services.append(ProxyServiceConfig(
+            name=name,
+            access_kind=access_kind,
+            base_url=fields.get("base_url", "").strip(),
+            auth_header=fields.get("auth_header", "").strip(),
+            timeout=timeout,
+            mcp_command=fields.get("mcp_command", "").strip(),
+            skill_name=fields.get("skill_name", "").strip(),
+        ))
+    return services
 
 
 def load_config() -> Config:
@@ -71,4 +131,7 @@ def load_config() -> Config:
 
         skills_dir=str(root / "skills"),
         remote_db_dir=str(root / "remote" / "skills"),
+        teams_root=str(root / "teams"),
+
+        proxy_services=_parse_proxy_services_from_env(),
     )

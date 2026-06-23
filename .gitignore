@@ -4,6 +4,7 @@
 # === Data ===
 remote/
 skills/
+teams/
 
 # === Claude CLI ===
 .claude/
