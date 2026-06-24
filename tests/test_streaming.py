@@ -1,15 +1,16 @@
 """
-流式输出测试用例 — 覆盖 StreamRenderer 渲染与 rebuild_state 重建。
+流式输出测试用例 — 覆盖 StreamRenderer 渲染（add-memory-persistence 之后）。
 
-覆盖场景（对应 specs/streaming-output）：
+add-memory-persistence 把"流式后手动重建对话状态"从 streaming-output 能力中移除。
+历史由 LangGraph SqliteSaver 按 thread_id 自动加载与落盘，CLI 不再维护
+rebuild_state / collected_messages / collected_state。
+
+覆盖场景（对应 specs/streaming-output 的 ADDED / MODIFIED 部分）：
   1. 逐 token 输出
   2. 工具调用流式可见（tool_call_chunks 首片段打印工具名）
-  3. 节点更新可见（updates 模式）
-  4. 工具返回展示
-  5. 重建完整消息列表（AI + Tool 顺序正确）
-  6. 多轮上下文连续（state 携带历史）
-  7. 多工具调用链重建
-  8. 异步启动 + 真实 graph 流式
+  3. 工具返回展示（updates 模式预览）
+  4. 异步入口（repl 是 coroutine）
+  5. astream + 真实 fake graph 端到端
 """
 
 import asyncio
@@ -19,10 +20,11 @@ from contextlib import redirect_stdout
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
-from src.interface.cli import StreamRenderer, rebuild_state
+from src.interface.cli import StreamRenderer
 
 
 # ── 渲染：逐 token + 工具调用 ────────────────────────────────────────
+
 
 class TestRenderMessages:
     """messages 模式渲染。"""
@@ -59,10 +61,11 @@ class TestRenderMessages:
         assert text.count("🛠 调用工具: search") == 1
 
 
-# ── 渲染：updates 模式（工具返回 + 节点） ────────────────────────────
+# ── 渲染：updates 模式（工具返回预览） ────────────────────────────────
+
 
 class TestRenderUpdates:
-    """updates 模式渲染与收集。"""
+    """updates 模式渲染：现在仅做预览打印，不再收集状态。"""
 
     def test_tool_return_displayed_and_truncated(self):
         renderer = StreamRenderer()
@@ -74,70 +77,27 @@ class TestRenderUpdates:
             ]}})
         text = out.getvalue()
         assert "📥 工具返回:" in text
-        # 截断到 300
+        # 截断到 300（预览长度）
         assert "x" * 300 in text
         assert "x" * 400 not in text
 
-    def test_non_message_state_collected(self):
-        """非 messages 键（如 todos）按 last-write-wins 收集。"""
+    def test_no_rebuild_state_export(self):
+        """rebuild_state 已被移除（REMOVED Requirement）—— 防止后续不慎复活。"""
+        from src.interface import cli
+        assert not hasattr(cli, "rebuild_state"), "rebuild_state 应已删除"
+
+    def test_renderer_does_not_collect_state(self):
+        """StreamRenderer 不再维护 collected_messages / collected_state。"""
         renderer = StreamRenderer()
-        renderer.handle("updates", {"agent": {"todos": [{"task": "a"}]}})
-        renderer.handle("updates", {"agent": {"todos": [{"task": "b"}]}})
-        assert renderer.collected_state["todos"] == [{"task": "b"}]
-
-
-# ── state 重建 ───────────────────────────────────────────────────────
-
-class TestRebuildState:
-    """流式后手动重建 state。"""
-
-    def test_rebuild_complete_messages(self):
-        """AI 消息 + Tool 消息顺序正确写入 state。"""
-        renderer = StreamRenderer()
-        ai = AIMessage(content="我来查一下", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "1"}])
-        tool = ToolMessage(content="结果", tool_call_id="1", name="search")
-        ai2 = AIMessage(content="查到了：结果")
-        renderer.handle("updates", {"agent": {"messages": [ai]}})
-        renderer.handle("updates", {"tools": {"messages": [tool]}})
-        renderer.handle("updates", {"agent": {"messages": [ai2]}})
-
-        input_state = {"messages": [HumanMessage(content="查 x")]}
-        new_state = rebuild_state(input_state, renderer)
-
-        assert new_state["messages"] == [HumanMessage(content="查 x"), ai, tool, ai2]
-
-    def test_multi_tool_chain_rebuild(self):
-        """多工具调用链：两次 tool_calls + 两个 ToolMessage 顺序正确。"""
-        renderer = StreamRenderer()
-        ai1 = AIMessage(content="", tool_calls=[
-            {"name": "f1", "args": {}, "id": "1"},
-            {"name": "f2", "args": {}, "id": "2"},
-        ])
-        t1 = ToolMessage(content="r1", tool_call_id="1", name="f1")
-        t2 = ToolMessage(content="r2", tool_call_id="2", name="f2")
-        ai2 = AIMessage(content="汇总")
-        for node, msgs in [("agent", [ai1]), ("tools", [t1, t2]), ("agent", [ai2])]:
-            renderer.handle("updates", {node: {"messages": msgs}})
-
-        new_state = rebuild_state({"messages": []}, renderer)
-        assert new_state["messages"] == [ai1, t1, t2, ai2]
-
-    def test_multi_turn_continuity(self):
-        """多轮：上一轮 state 历史被携带到下一轮。"""
-        history = [HumanMessage(content="我叫张三"), AIMessage(content="你好张三")]
-        renderer = StreamRenderer()
-        renderer.handle("updates", {"agent": {"messages": [AIMessage(content="有什么帮你的")]}}, )
-
-        new_state = rebuild_state({"messages": history + [HumanMessage(content="你好")]}, renderer)
-        # 历史 + 本轮用户 + 本轮 AI
-        assert len(new_state["messages"]) == 4
-        assert new_state["messages"][0].content == "我叫张三"
+        assert not hasattr(renderer, "collected_messages")
+        assert not hasattr(renderer, "collected_state")
 
 
 # ── 异步端到端：真实 graph + fake 流式模型 ────────────────────────────
 
+
 class TestAsyncStreamingIntegration:
-    """真实 compiled graph + 流式 fake model，验证 astream 与重建。"""
+    """真实 compiled graph + 流式 fake model，验证 astream 渲染。"""
 
     def _build_graph(self, messages_iter):
         """构造一个单 LLM 节点的最小 graph，模型从迭代器吐 chunk。"""
@@ -160,9 +120,8 @@ class TestAsyncStreamingIntegration:
         g.set_finish_point("call")
         return g.compile()
 
-    def test_async_stream_tokens_and_rebuild(self):
-        """astream 流式输出经渲染器，rebuild_state 拿到完整消息。"""
-        # 单条消息；token 级多片段渲染由 test_token_by_token_output 覆盖
+    def test_async_stream_tokens(self):
+        """astream 流式输出经渲染器打印出完整文本。"""
         chunks = [AIMessage(content="你好，世界")]
         app = self._build_graph(chunks)
 
@@ -181,11 +140,6 @@ class TestAsyncStreamingIntegration:
 
         text = out.getvalue()
         assert "你好" in text and "世界" in text
-        # 重建出完整 AIMessage
-        new_state = rebuild_state({"messages": [HumanMessage(content="hi")]}, renderer)
-        assert len(new_state["messages"]) == 2
-        assert isinstance(new_state["messages"][1], AIMessage)
-        assert new_state["messages"][1].content == "你好，世界"
 
     def test_main_uses_asyncio_run(self):
         """main() SHALL 用 asyncio.run 启动（异步入口）。"""

@@ -1,10 +1,13 @@
 """
 Agent 构建模块 — 每次请求重新实例化 DeepAgents Agent。
 
-每次调用 build_agent() 都会创建一个全新的 Agent 实例，
-确保 system prompt 中包含最新的 skill 内容。
+每次调用 build_agent() 都会创建一个全新的 Agent 实例，确保 system prompt 中
+包含最新的 skill 内容。
 
-通过 MemorySaver + thread_id 保持同一会话的上下文连续性。
+记忆 / checkpointer 由调用方注入（add-memory-persistence）：
+  - Leader：`SqliteSaver`（src.persistence.LeaderStore），跨进程持久化
+  - Teammate：`MemorySaver`，仅请求内累积
+  - 兼容旧用法：不传 checkpointer 时回退到 `MemorySaver()`
 """
 
 from pathlib import Path
@@ -12,6 +15,7 @@ from typing import Sequence
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 
 from deepagents import create_deep_agent
@@ -24,6 +28,7 @@ def build_agent(
     system_prompt: str | None = None,
     tools: Sequence[BaseTool] | None = None,
     debug: bool = False,
+    checkpointer: BaseCheckpointSaver | None = None,
 ):
     """创建新的 DeepAgents Agent 实例。
 
@@ -43,7 +48,21 @@ def build_agent(
         system_prompt: 自定义 system prompt（如 Teammate 注入协作指令）。
         tools: 额外注册的工具（如 Leader 的编排工具、Teammate 的访问工具）。
         debug: 是否输出 DeepAgents 调试信息。
+        checkpointer: LangGraph 兼容的状态持久化器。
+          - None（默认）：回退到 `MemorySaver()`，与旧版行为一致
+          - Leader 应传入 `LeaderStore.get_checkpointer()`（SqliteSaver）
+          - Teammate 应传入 `MemorySaver()`（每个 Teammate 一份）
+
+    Raises:
+        TypeError: 当 checkpointer 不是 BaseCheckpointSaver 子类时。
     """
+    if checkpointer is None:
+        checkpointer = MemorySaver()
+    elif not isinstance(checkpointer, BaseCheckpointSaver):
+        raise TypeError(
+            f"checkpointer 必须是 BaseCheckpointSaver 子类，got {type(checkpointer).__name__}"
+        )
+
     if skills_dir:
         skills_path = Path(skills_dir).resolve()
         # 父目录 = 虚拟根；skills 目录在虚拟空间中表现为 /{skills 目录名}
@@ -57,7 +76,7 @@ def build_agent(
 
     kwargs = dict(
         model=model,
-        checkpointer=MemorySaver(),
+        checkpointer=checkpointer,
         debug=debug,
         backend=backend,
     )

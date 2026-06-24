@@ -178,7 +178,7 @@ class _FakeAgent:
 
 def _patch_teammate(monkeypatch, teammate: Teammate, reply: str):
     """替换 Teammate.build_agent_for_prompt 返回 fake agent，避开 deepagents 真实工厂。"""
-    def fake(self, base_prompt: str = ""):
+    def fake(self, base_prompt: str = "", checkpointer=None):
         return _FakeAgent(reply)
     monkeypatch.setattr(teammate, "build_agent_for_prompt", fake.__get__(teammate, Teammate))
 

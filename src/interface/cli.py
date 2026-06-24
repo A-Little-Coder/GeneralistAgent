@@ -1,12 +1,17 @@
 """
-CLI 交互模块 — 异步流式渲染与用户交互主循环。
+CLI 交互模块 — 异步流式渲染、多会话切换与用户交互主循环。
 
-设计要点（见 openspec/changes/add-agent-team-orchestration）：
-  - 使用 agent.astream(stream_mode=["messages","updates"]) 真异步流式输出
-  - messages 模式：逐 token 渲染 AIMessageChunk（含 tool_call_chunks）
-  - updates 模式：节点边界展示工具返回，并收集完整消息用于手动重建 state
-  - 流式结束后手动重建 state["messages"]（与其他 state 键 last-write-wins 合并），
-    保持多轮上下文连续（因每轮 build_agent 使用全新 MemorySaver，需手动携带 state）
+设计要点（add-memory-persistence）：
+  - **持久化**：Leader 使用 `LeaderStore`(SqliteSaver) 跨进程保留对话历史；
+    `thread_id = session_id`，由 `SessionManager` 维护多会话切换。
+  - **不再 rebuild_state**：每轮只把新消息 `[HumanMessage(user_input)]` 喂给
+    `agent.astream`，历史由 checkpointer 自动加载与写回。
+  - **流式渲染**：保留 messages 模式逐 token 输出 + updates 模式工具返回预览，
+    但渲染器不再维护"重建用"的消息列表。
+  - **Session 命令**：`/new` `/sessions` `/switch` `/delete` `/title` `/help`，
+    在 `_repl_loop` 入口识别 `/` 前缀路由。
+  - **Teammate 焚毁**：每轮 finally 调 `team_manager.cleanup_spawned_in_turn()`，
+    本轮新建的 Teammate 在请求结束时立刻销毁（X2 记忆）。
 """
 
 import asyncio
@@ -15,12 +20,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage
 
 from src.core.agent import build_agent
 from src.core.config import Config
 from src.interface import log
 from src.orchestration.team import TeamManager
 from src.orchestration.tools import OrchestrationContext, build_orchestration_tools
+from src.persistence import LeaderStore, SessionManager
 from src.skills.center import SkillCenter
 
 
@@ -44,7 +51,7 @@ _BANNER = """
 ║          Generalist Agent — 供应链ChatBI          ║
 ║                                                  ║
 ║  输入 exit / quit / q 退出                         ║
-║  技能修改无需重启，自动感知最新变更                     ║
+║  /help 查看会话命令；技能修改 Leader 自动感知        ║
 ╚══════════════════════════════════════════════════╝
 """
 
@@ -68,7 +75,7 @@ _SYSTEM_PROMPT = """你是一个智能助手（团队 Leader）。
   5. 收到 task_completed 消息后汇总结果回复用户；收到 task_failed 时上报失败原因
 - 你看不到代理服务的连接细节（host / token），这些由系统装配，安全。
 - 可用的代理服务名见 .env 中 PROXY_<NAME>_* 配置。
-- 一个查询请求只需要建 **一个** Teammate，分配 **一个** 任务即可。
+- 同一请求内可以多次给同名 Teammate 派任务 / 发消息，Teammate 在请求内记得之前的对话。
 
 # 注意
 - 不要在没有相应需求时随意建团 / 拉 Teammate，避免开销。
@@ -82,24 +89,21 @@ _TOOL_RETURN_PREVIEW = 300
 _TOOL_ARGS_PREVIEW = 200
 
 
-class StreamRenderer:
-    """流式事件渲染器 —— 持有跨 chunk 的展示状态。
+# ── 流式渲染器 ───────────────────────────────────────────────────────
 
-    职责：
-      - messages 模式：逐 token 打印 LLM 文本与工具调用名
-      - updates 模式：打印工具返回预览，并收集完整消息供 state 重建
+
+class StreamRenderer:
+    """流式事件渲染器 —— 仅负责打印，不再维护"重建用"的消息列表。
+
+    add-memory-persistence：删除了 collected_messages / collected_state，
+    历史由 SqliteSaver 按 thread_id 自动加载与写回。
     """
 
     def __init__(self) -> None:
         # 已打印过工具名的 (node, tool_name) 集合，避免重复打印
         self._printed_tools: set[tuple[str, str]] = set()
-        # 收集到的完整消息（按到达顺序），用于手动重建 state
-        self.collected_messages: list = []
-        # 收集到的非 messages 状态键更新（last-write-wins），用于重建其他 state
-        self.collected_state: dict[str, Any] = {}
 
     def handle(self, mode: str, data: Any) -> None:
-        """处理单个流式 chunk。"""
         if mode == "messages":
             self._handle_messages(data)
         elif mode == "updates":
@@ -108,75 +112,174 @@ class StreamRenderer:
     # ── messages 模式：token 级渲染 ──────────────────────────────────
 
     def _handle_messages(self, data: Any) -> None:
-        """data 形如 (chunk, metadata)。"""
         chunk, metadata = data
         node = (metadata or {}).get("langgraph_node", "")
 
-        # 逐 token 文本输出
         content = getattr(chunk, "content", None)
         if content:
             print(content, end="", flush=True)
 
-        # 工具调用流式片段：首个片段携带工具名
         tool_call_chunks = getattr(chunk, "tool_call_chunks", None) or []
         for tc in tool_call_chunks:
             name = tc.get("name") if isinstance(tc, dict) else None
             if name and (node, name) not in self._printed_tools:
                 self._printed_tools.add((node, name))
-                print()  # 换行，与前面的 token 流分隔
+                print()
                 log.leader_log(f"🛠 调用工具: {name}")
                 args = str(tc.get("args", ""))
                 if args:
                     log.leader_log(f"   参数: {args[:_TOOL_ARGS_PREVIEW]}")
 
-    # ── updates 模式：节点边界 + 工具返回 + 消息收集 ─────────────────
+    # ── updates 模式：工具返回预览（不再收集状态） ────────────────────
 
     def _handle_updates(self, data: Any) -> None:
-        """data 形如 {node_name: {state_key: value}}。"""
-        for node, update in (data or {}).items():
+        for _node, update in (data or {}).items():
             if not isinstance(update, dict):
                 continue
-            for key, value in update.items():
-                if key == "messages":
-                    msgs = value if isinstance(value, list) else [value]
-                    for m in msgs:
-                        self.collected_messages.append(m)
-                        # 工具返回即时展示预览
-                        if getattr(m, "type", "") == "tool":
-                            preview = str(getattr(m, "content", ""))[:_TOOL_RETURN_PREVIEW]
-                            print()  # 换行
-                            log.leader_log(f"📥 工具返回: {preview}")
-                else:
-                    # 非 messages 键：last-write-wins（如 deepagents 的 todos）
-                    self.collected_state[key] = value
+            msgs = update.get("messages")
+            if not msgs:
+                continue
+            for m in msgs if isinstance(msgs, list) else [msgs]:
+                if getattr(m, "type", "") == "tool":
+                    preview = str(getattr(m, "content", ""))[:_TOOL_RETURN_PREVIEW]
+                    print()
+                    log.leader_log(f"📥 工具返回: {preview}")
 
 
-def rebuild_state(input_state: dict, renderer: StreamRenderer) -> dict:
-    """流式结束后手动重建完整 state。
+async def _run_turn(agent, user_input: str, session_id: str) -> None:
+    """执行单轮流式请求。
 
-    - messages：input_state 既有消息 + 本轮流式收集到的完整消息（AI/Tool 顺序正确）
-    - 其他键（如 todos）：取 updates 中 last-write-wins 的值
+    历史由 checkpointer 按 thread_id=session_id 自动加载；本函数仅推送新消息。
     """
-    new_state: dict[str, Any] = dict(input_state)
-    # messages 以 input 已有历史为基础追加新消息
-    base_msgs = list(new_state.get("messages", []))
-    base_msgs.extend(renderer.collected_messages)
-    new_state["messages"] = base_msgs
-    # 合并其他状态键
-    new_state.update(renderer.collected_state)
-    return new_state
-
-
-async def _run_turn(agent, state: dict, invoke_config: dict) -> dict:
-    """执行单轮流式请求并返回重建后的 state。"""
     renderer = StreamRenderer()
+    state = {"messages": [HumanMessage(content=user_input)]}
+    invoke_config = {"configurable": {"thread_id": session_id}}
     async for mode, data in agent.astream(
         state, config=invoke_config, stream_mode=["messages", "updates"]
     ):
         renderer.handle(mode, data)
-    # 换行收尾，分隔本轮输出与下一轮提示符
+    print()  # 换行收尾
+
+
+# ── 命令路由 ─────────────────────────────────────────────────────────
+
+
+_COMMAND_HELP = """
+会话命令：
+  /new                 新建一个会话并切换为当前
+  /sessions  /list     列出所有会话（标 ★ 为当前）
+  /switch <序号|id>    切换到指定会话
+  /delete <序号|id>    删除会话（需确认；会同步清掉历史）
+  /title <新标题>      重命名当前会话
+  /help  /?            显示本帮助
+  exit / quit / q      退出程序
+"""
+
+
+def _resolve_session(sm: SessionManager, ref: str):
+    """把 '序号'（从 1 开始）或 'id' 解析为 Session 对象，找不到返回 None。"""
+    ref = ref.strip()
+    if not ref:
+        return None
+    sessions = sm.list()
+    # 先尝试当序号
+    try:
+        idx = int(ref)
+        if 1 <= idx <= len(sessions):
+            return sessions[idx - 1]
+    except ValueError:
+        pass
+    # 当 id
+    return sm.get(ref)
+
+
+def _print_sessions(sm: SessionManager) -> None:
+    sessions = sm.list()
+    current_id = sm.current_id
+    if not sessions:
+        print("(无会话)")
+        return
     print()
-    return rebuild_state(state, renderer)
+    for i, s in enumerate(sessions, 1):
+        marker = "★" if s.id == current_id else " "
+        title = s.title or "(未命名)"
+        print(f"  {marker} [{i}] {s.id}  {title}  ({s.last_active_at})")
+    print()
+
+
+async def _ainput(prompt: str) -> str:
+    """非阻塞 input 包装。"""
+    return await asyncio.get_event_loop().run_in_executor(None, lambda: input(prompt))
+
+
+async def _handle_command(
+    line: str,
+    sm: SessionManager,
+    store: LeaderStore,
+) -> bool:
+    """处理 `/...` 命令；返回 True 表示已处理（无需走 agent 推理）。"""
+    parts = line.strip().split(maxsplit=1)
+    cmd = parts[0].lower()
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if cmd in ("/help", "/?"):
+        print(_COMMAND_HELP)
+        return True
+
+    if cmd == "/new":
+        sess = sm.new()
+        print(f"\n✓ 新建会话 {sess.id}（已切换）")
+        return True
+
+    if cmd in ("/sessions", "/list"):
+        _print_sessions(sm)
+        return True
+
+    if cmd == "/switch":
+        target = _resolve_session(sm, arg)
+        if target is None:
+            print(f"✗ 未找到会话 '{arg}'，可用 /sessions 查看")
+            return True
+        sm.switch(target.id)
+        title = target.title or "(未命名)"
+        print(f"\n✓ 切换到 {target.id}  {title}")
+        return True
+
+    if cmd == "/delete":
+        target = _resolve_session(sm, arg)
+        if target is None:
+            print(f"✗ 未找到会话 '{arg}'")
+            return True
+        title = target.title or "(未命名)"
+        confirm = (await _ainput(
+            f"确定删除会话 '{target.id}'（{title}）? [y/N] "
+        )).strip().lower()
+        if confirm != "y":
+            print("已取消删除")
+            return True
+        await sm.delete(target.id, leader_store=store)
+        new_current = sm.get_current()
+        print(f"✓ 已删除 {target.id}；当前会话 → {new_current.id if new_current else '?'}")
+        return True
+
+    if cmd == "/title":
+        if not arg:
+            print("用法：/title <新标题>")
+            return True
+        current = sm.get_current()
+        if current is None:
+            print("✗ 没有当前会话")
+            return True
+        sm.rename(current.id, arg)
+        print(f"✓ 已重命名 {current.id} → {arg}")
+        return True
+
+    # 未知命令
+    print(f"未知命令: {cmd}；输入 /help 查看可用命令")
+    return True
+
+
+# ── 主循环 ───────────────────────────────────────────────────────────
 
 
 async def repl(
@@ -186,20 +289,21 @@ async def repl(
 ) -> None:
     """异步交互式主循环。
 
-    每次用户输入：
-      1. SkillCenter 检测技能是否变更
-      2. 重新实例化 Agent（确保技能和 prompt 最新，Leader 的编排工具最新）
-      3. 调用 Agent.astream() 流式处理请求，逐 token 输出
-      4. 手动重建 state 保持多轮上下文连续
-
-    Args:
-        model: Leader 的 LLM 实例。
-        skill_center: 技能中心（检测变更 + 同步）。
-        config: 可选配置项。传入了则注入团队编排工具，Leader 具备多 Agent 能力。
+    每轮：
+      1. SkillCenter 检测技能变更
+      2. 重新实例化 Leader Agent（注入 SqliteSaver checkpointer）
+      3. agent.astream 流式处理；历史由 checkpointer 自动加载
+      4. 流式结束后 cleanup_spawned_in_turn 焚毁本轮 Teammate
     """
     print(_BANNER)
 
-    # ── 编排基础设施（可选） ───────────────────────────────────────
+    # ── 持久化层 ─────────────────────────────────────────────────────
+    store = await LeaderStore.create()
+    sm = SessionManager()
+    current = sm.bootstrap()
+    print(f"当前会话：{current.id}  {current.title or '(未命名)'}")
+
+    # ── 编排基础设施 ─────────────────────────────────────────────────
     team_manager = TeamManager(
         teams_root=Path(config.teams_root) if config and config.teams_root else None
     )
@@ -212,34 +316,41 @@ async def repl(
         )
         orchestration_tools = build_orchestration_tools(ctx)
 
-    state: dict = {"messages": []}
-    invoke_config = {"configurable": {"thread_id": "generalist-agent-session"}}
-
     try:
-        await _repl_loop(model, skill_center, state, invoke_config, orchestration_tools)
+        await _repl_loop(
+            model=model,
+            skill_center=skill_center,
+            store=store,
+            sm=sm,
+            team_manager=team_manager,
+            orchestration_tools=orchestration_tools,
+        )
     finally:
-        # 退出时清理所有 Teammate（4.4 清理钩子）
+        # 退出时清理：所有团队 + leader 持久化
         if config:
             try:
                 await team_manager.cleanup_all()
             except Exception as e:
                 print(f"\n[清理告警] cleanup_all 失败：{e}")
+        try:
+            await store.aclose()
+        except Exception:
+            pass
 
 
 async def _repl_loop(
     model: BaseChatModel,
     skill_center: SkillCenter,
-    state: dict,
-    invoke_config: dict,
+    store: LeaderStore,
+    sm: SessionManager,
+    team_manager: TeamManager,
     orchestration_tools: list,
 ) -> None:
-    """REPL 主循环 —— 抽出来以便外层在 finally 中做清理。"""
     while True:
+        current = sm.get_current()
+        prompt_label = current.id if current else "?"
         try:
-            user_input = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: input("\n你 > ")
-            )
-            user_input = user_input.strip()
+            user_input = (await _ainput(f"\n[{prompt_label}] 你 > ")).strip()
         except (EOFError, KeyboardInterrupt):
             print("\n\n再见！")
             break
@@ -251,17 +362,35 @@ async def _repl_loop(
             print("\n再见！")
             break
 
-        # 1. 检测技能变更，清除缓存
-        state = skill_center.decorate_state(state)
+        # 命令路由
+        if user_input.startswith("/"):
+            await _handle_command(user_input, sm, store)
+            continue
 
-        # 2. 重新实例化 Agent（注入编排工具，Leader 因此获得团队能力）
+        # 1. 技能变更检测（SkillCenter）
+        _ = skill_center.decorate_state({})  # 仅触发同步，不再依赖返回值挂 state
+
+        # 2. 标题自动填充（仅 title 为空时）
+        if current is not None:
+            sm.set_title_if_empty(current.id, user_input)
+
+        # 3. 构建 Leader Agent（注入 SqliteSaver + 编排工具）
         agent = build_agent(
             model=model,
             skills_dir=skill_center.get_skills_dir(),
             system_prompt=_SYSTEM_PROMPT,
             tools=orchestration_tools or None,
+            checkpointer=store.get_checkpointer(),
         )
 
-        # 3. 发送请求（流式）
-        state["messages"].append({"role": "user", "content": user_input})
-        state = await _run_turn(agent, state, invoke_config)
+        # 4. 流式推理（历史由 checkpointer 自动加载）
+        try:
+            await _run_turn(agent, user_input, current.id if current else "default")
+        finally:
+            # 5. 每轮焚毁本轮新建的 Teammate（X2 语义）
+            try:
+                cleaned = await team_manager.cleanup_spawned_in_turn()
+                if cleaned:
+                    log.indent_log(f"cleanup_spawned_in_turn ✓ 已清理 {cleaned} 个 Teammate")
+            except Exception as e:
+                log.indent_log(f"cleanup_spawned_in_turn ✗ {type(e).__name__}: {e}")

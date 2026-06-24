@@ -179,7 +179,9 @@ async def test_e2e_orchestration_chatbi(orchestration_ctx, monkeypatch):
     assert r["status"] == "ok"
     assert "chatbi_query" in r["tools"]
 
-    # 3) 把 Teammate 的 build_agent_for_prompt 替换成 fake，直接调工具
+    # 3) 把 Teammate 的 _agent 替换成 fake，直接调工具
+    # 注：自 add-memory-persistence 起，Runner 在启动时一次性构建并缓存 agent，
+    # 所以测试需替换 runner._agent，而非 teammate.build_agent_for_prompt
     team = orchestration_ctx.team_manager.get("main")
     teammate, runner = team.members["chatbi_proxy"]
 
@@ -194,7 +196,10 @@ async def test_e2e_orchestration_chatbi(orchestration_ctx, monkeypatch):
                 AIMessage(content=f"完成；SQL={out['sql']}")
             ]}})
 
-    teammate.build_agent_for_prompt = lambda base_prompt="": _FakeAgent(teammate.tools)  # type: ignore
+    # 让 Runner 用 fake；保持 build_agent_for_prompt 兼容，仍替换签名
+    fake_agent = _FakeAgent(teammate.tools)
+    teammate.build_agent_for_prompt = lambda base_prompt="", checkpointer=None: fake_agent  # type: ignore
+    runner._agent = fake_agent
 
     # 4) assign_task
     r = _t(tools, "assign_task").invoke({
@@ -234,9 +239,9 @@ async def test_send_message_to_teammate(orchestration_ctx):
     })
     assert r["status"] == "ok"
 
-    # 替 fake，避免真打 LLM
+    # 替 fake，避免真打 LLM（Runner 启动后已缓存 agent，故同时替换 _agent）
     team = orchestration_ctx.team_manager.get("main")
-    teammate, _ = team.members["chatbi_proxy"]
+    teammate, runner = team.members["chatbi_proxy"]
     received: list[str] = []
 
     class _Fake:
@@ -244,7 +249,9 @@ async def test_send_message_to_teammate(orchestration_ctx):
             received.append(state["messages"][-1].content)
             yield ("updates", {"agent": {"messages": [AIMessage(content="ack")]}})
 
-    teammate.build_agent_for_prompt = lambda base_prompt="": _Fake()  # type: ignore
+    fake = _Fake()
+    teammate.build_agent_for_prompt = lambda base_prompt="", checkpointer=None: fake  # type: ignore
+    runner._agent = fake
 
     r = await _t(tools, "send_message").ainvoke({
         "to": "chatbi_proxy",

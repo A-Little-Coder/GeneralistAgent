@@ -93,12 +93,14 @@ class Teammate:
             color=assign_color(teammate_id),
         )
 
-    def build_agent_for_prompt(self, base_prompt: str = ""):
+    def build_agent_for_prompt(self, base_prompt: str = "", checkpointer=None):
         """为某次 prompt 构建该 Teammate 的 DeepAgents Agent。
 
         - 注入协作 system prompt
         - 装配该 Teammate 的工具集（含访问外部服务的工具）
         - 使用该 Teammate 自己的 LLM 实例
+        - 可选注入 checkpointer（Runner 会传 MemorySaver 让本请求内累积记忆）；
+          不传则 build_agent 内部回退到新的 MemorySaver()
         """
         system_prompt = (base_prompt or "") + (self.extra_system_prompt or "") + _TEAMMATE_COOP_PROMPT
         return build_agent(
@@ -106,6 +108,7 @@ class Teammate:
             skills_dir=self.skills_dir,
             system_prompt=system_prompt,
             tools=self.tools or None,
+            checkpointer=checkpointer,
         )
 
 

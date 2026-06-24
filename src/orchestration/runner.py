@@ -20,6 +20,7 @@ import asyncio
 from typing import Optional
 
 from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.memory import MemorySaver
 
 from src.interface import log
 from src.orchestration.context import run_in_teammate_context
@@ -40,7 +41,14 @@ _KIND_MESSAGE_REPLY = "message_reply"
 
 
 class Runner:
-    """单个 Teammate 的运行循环。"""
+    """单个 Teammate 的运行循环。
+
+    记忆模型（add-memory-persistence，X2）：
+      - Runner 启动时一次性 `build_agent_for_prompt()` 并缓存到 self._agent
+      - 每个 Teammate 独享一个 MemorySaver，thread_id = teammate_id
+      - 本请求内多次唤起共享同一份 state；请求结束 cleanup_spawned_in_turn 销毁
+      - SKILL 在 Runner 启动那一刻冻结（不再每 turn 重建 Agent）
+    """
 
     def __init__(
         self,
@@ -60,6 +68,9 @@ class Runner:
         self._task: Optional[asyncio.Task] = None
         self._shutdown = asyncio.Event()
         self._last_output: str = ""           # 上一轮 agent 的最终文本（便于上层观察/测试）
+        # X2 记忆：Runner 持有 Teammate 独享的 MemorySaver + 缓存的 Agent
+        self._memory_saver: MemorySaver = MemorySaver()
+        self._agent = None                    # 首次进入 _loop 时懒构建
 
     # ── 生命周期 ────────────────────────────────────────────────────
 
@@ -96,6 +107,11 @@ class Runner:
 
     async def _loop(self) -> None:
         """idle 循环主体。退出条件：收到 shutdown_request。"""
+        # 首次进入循环时构建一次 Agent + checkpointer，后续 turn 复用 —— X2 记忆基础
+        if self._agent is None:
+            self._agent = self._teammate.build_agent_for_prompt(
+                checkpointer=self._memory_saver,
+            )
         try:
             while not self._shutdown.is_set():
                 # 1) 消息优先
@@ -187,11 +203,14 @@ class Runner:
     async def _run_one_turn(self, prompt: str) -> str:
         """运行一轮 agent loop，返回最终 AI 文本。
 
-        每轮重新 build_agent_for_prompt —— 保证 SKILL 与工具是最新的。
-        每轮从初始 prompt 构建上下文（不继承 Leader 完整对话历史）。
+        X2 记忆（add-memory-persistence）：
+          - 复用 `self._agent`（首次进入 _loop 时构建），不再每 turn build
+          - thread_id = teammate_id；MemorySaver 跨 turn 累积本请求内的全部消息
+          - 下次唤起时 LangGraph 按 thread_id 自动加载历史，调用方只传新消息
         设超时保护：超过 self._turn_timeout 秒则终止并返回超时提示。
         """
-        agent = self._teammate.build_agent_for_prompt()
+        assert self._agent is not None, "Runner._agent 未初始化（_loop 应已构建）"
+        agent = self._agent
         state = {"messages": [HumanMessage(content=prompt)]}
         cfg = {"configurable": {"thread_id": self._teammate.context.teammate_id}}
         name = self._teammate.name

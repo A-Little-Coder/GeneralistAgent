@@ -5,6 +5,11 @@
 remote/
 skills/
 teams/
+memory/
+
+# === Python ===
+__pycache__/
+*.pyc
 
 # === Claude CLI ===
 .claude/

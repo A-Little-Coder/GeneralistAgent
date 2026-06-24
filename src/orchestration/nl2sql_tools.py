@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from src.interface import log
 from src.orchestration.proxy_tools import ProxyServiceConfig
+from src.persistence.tool_truncate import truncate_for_persist
 
 
 # ── 超时分层 ──────────────────────────────────────────────────────────
@@ -119,7 +120,7 @@ def _build_query_tool(svc: ProxyServiceConfig) -> BaseTool:
                         return {
                             "status": "error",
                             "http_status": resp.status_code,
-                            "body": text,
+                            "body": truncate_for_persist(text),
                         }
                     async for line in resp.aiter_lines():
                         if not line or line.startswith(":"):

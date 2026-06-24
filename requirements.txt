@@ -1,0 +1,22 @@
+# GeneralistAgent 运行依赖清单
+# 安装：pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 仅列出本项目直接 import 的顶层包；间接依赖由 pip 解析安装。
+# 版本号采用 ">=" 下限策略，给上游小版本升级保留余地。
+
+# ── LLM / Agent 核心 ─────────────────────────────────────
+langchain>=1.3.9
+langchain-core>=1.4.7
+langchain-openai>=1.3.2
+langgraph>=1.2.5
+langgraph-checkpoint>=4.1.1
+langgraph-checkpoint-sqlite>=3.1.0     # Leader 跨进程对话历史持久化（add-memory-persistence）
+deepagents>=0.6.10
+
+# ── 工具 / 配置 ──────────────────────────────────────────
+python-dotenv>=1.0
+httpx>=0.27                            # 代理工具与 SSE 适配
+
+# ── 测试 ────────────────────────────────────────────────
+pytest>=9.1
+pytest-asyncio>=1.4

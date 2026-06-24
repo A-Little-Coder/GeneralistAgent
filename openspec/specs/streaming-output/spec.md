@@ -19,21 +19,6 @@ CLI SHALL 使用 asyncio 驱动，通过 `agent.astream(stream_mode=["messages",
 - **WHEN** 工具节点完成并产生 ToolMessage
 - **THEN** 控制台 SHALL 打印"📥 工具返回:"及截断后的返回内容
 
-### Requirement: 流式后手动重建对话状态
-系统 SHALL 在流式结束后手动重建完整的 `state["messages"]`，以保持多轮对话上下文连续，而非依赖 astream 直接返回的 state。
-
-#### Scenario: 重建完整消息列表
-- **WHEN** 一次流式请求结束（包含 AI 文本、工具调用、工具返回）
-- **THEN** 系统 SHALL 将累积的 AIMessageChunk 合并为完整 AIMessage，并从 updates 收集所有 ToolMessage，组成完整 messages 列表写入 state
-
-#### Scenario: 多轮上下文连续
-- **WHEN** 用户连续多轮提问
-- **THEN** 每轮流式结束后重建的 state SHALL 包含全部历史消息，下一轮 Agent 能引用前文上下文
-
-#### Scenario: 多工具调用链重建
-- **WHEN** 一次请求中 LLM 连续调用多个工具（tool_calls 链）
-- **THEN** 重建的 messages SHALL 包含每次工具调用对应的 AIMessage（含 tool_calls）与对应 ToolMessage，顺序正确
-
 ### Requirement: 异步入口
 程序 SHALL 通过 `asyncio.run()` 启动异步 REPL 主循环。
 
@@ -44,3 +29,7 @@ CLI SHALL 使用 asyncio 驱动，通过 `agent.astream(stream_mode=["messages",
 #### Scenario: 输入与流式不互相阻塞
 - **WHEN** 一个 Teammate 正在流式生成时（多 Agent 场景）
 - **THEN** asyncio 事件循环 SHALL 允许其他协程（如 Leader 处理其他消息）并发执行，不被单个 LLM 调用阻塞
+
+#### Scenario: 退出前清理本轮 Teammate
+- **WHEN** REPL 主循环每轮结束（包括正常完成、Ctrl+C、异常）
+- **THEN** SHALL 调用 `team_manager.cleanup_spawned_in_turn()`，本轮新建的 Teammate Runner 全部 shutdown 完毕后再读取下一行输入

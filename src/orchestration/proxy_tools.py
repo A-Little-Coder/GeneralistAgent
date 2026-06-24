@@ -30,6 +30,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
 from src.interface import log
+from src.persistence.tool_truncate import truncate_for_persist
 
 
 # ── 配置数据类 ─────────────────────────────────────────────────────────
@@ -131,7 +132,7 @@ def _build_http_query_tool(svc: ProxyServiceConfig) -> BaseTool:
                         return {
                             "status": "error",
                             "http_status": resp.status_code,
-                            "body": _safe_text(resp),
+                            "body": truncate_for_persist(_safe_text(resp)),
                         }
                     log.proxy_log(f"🡐 ✓ HTTP {resp.status_code}")
                     return _try_json(resp)

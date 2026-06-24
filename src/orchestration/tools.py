@@ -35,6 +35,7 @@ from src.orchestration.teammate import (
     create_proxy_teammate,
     create_teammate,
 )
+from src.persistence.tool_truncate import truncate_for_persist
 
 
 # ── ctx：所有编排工具共享的运行时句柄 ────────────────────────────────
@@ -342,7 +343,7 @@ def _tool_task_list_query(ctx: OrchestrationContext) -> BaseTool:
                     "status": t.status,
                     "assignee": t.assignee,
                     "description": t.description,
-                    "result": t.result,
+                    "result": truncate_for_persist(t.result) if t.result else t.result,
                 }
                 for t in all_tasks
             ],
@@ -381,11 +382,12 @@ def _tool_wait_for_message(ctx: OrchestrationContext) -> BaseTool:
         log.indent_log(
             f"wait_for_message ✓ from={msg.sender} kind={msg.kind} meta={log.fmt_kv(msg.meta or {})}"
         )
+        # 工具返回入 Leader 上下文持久化（add-memory-persistence）：长 content 截断
         return {
             "status": "ok",
             "from": msg.sender,
             "kind": msg.kind,
-            "content": msg.content,
+            "content": truncate_for_persist(msg.content),
             "meta": msg.meta or {},
             "team": team.name,
         }

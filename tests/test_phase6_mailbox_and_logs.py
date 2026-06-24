@@ -41,7 +41,7 @@ class _FakeAgent:
 
 
 def _patch(teammate: Teammate, agent: _FakeAgent):
-    teammate.build_agent_for_prompt = lambda base_prompt="": agent  # type: ignore
+    teammate.build_agent_for_prompt = lambda base_prompt="", checkpointer=None: agent  # type: ignore
 
 
 # ── 1. Runner 自动投递 task_completed ─────────────────────────────────

@@ -132,7 +132,7 @@ async def test_e2e_proxy_teammate_calls_mock_chatbi(mock_chatbi_server, tmp_path
     )
 
     # 3) 替换 build_agent_for_prompt 为 fake agent —— 验证工具能真正调用 mock
-    teammate.build_agent_for_prompt = lambda base_prompt="": _FakeProxyAgent(teammate.tools)  # type: ignore
+    teammate.build_agent_for_prompt = lambda base_prompt="", checkpointer=None: _FakeProxyAgent(teammate.tools)  # type: ignore
 
     # 4) 启动 Runner
     mailbox = Mailbox()
