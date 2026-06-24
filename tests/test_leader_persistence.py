@@ -80,7 +80,8 @@ class TestCrossProcessRecovery:
     async def test_write_close_reopen_recover(self, tmp_path: Path):
         store1 = await LeaderStore.create(memory_dir=tmp_path)
         try:
-            await self._write_checkpoint(store1, "sess-A", "你好")
+            # 用复合 thread_id 写入（add-user-scope-to-memory 之后的格式）
+            await self._write_checkpoint(store1, "alice:sess-A", "你好")
         finally:
             await store1.aclose()
 
@@ -88,7 +89,7 @@ class TestCrossProcessRecovery:
         store2 = await LeaderStore.create(memory_dir=tmp_path)
         try:
             cp = await store2.get_checkpointer().aget_tuple(
-                {"configurable": {"thread_id": "sess-A", "checkpoint_ns": ""}}
+                {"configurable": {"thread_id": "alice:sess-A", "checkpoint_ns": ""}}
             )
             assert cp is not None
             channels = cp.checkpoint.get("channel_values", {})
@@ -101,11 +102,12 @@ class TestCrossProcessRecovery:
     async def test_multiple_thread_ids_isolated(self, tmp_path: Path):
         store = await LeaderStore.create(memory_dir=tmp_path)
         try:
-            await self._write_checkpoint(store, "sess-A", "Alice")
-            await self._write_checkpoint(store, "sess-B", "Bob")
+            await self._write_checkpoint(store, "alice:sess-A", "Alice")
+            await self._write_checkpoint(store, "bob:sess-A", "Bob")
 
             ids = set(await store.list_thread_ids())
-            assert {"sess-A", "sess-B"}.issubset(ids)
+            # 同名 session 在不同 user 下互不干扰
+            assert {"alice:sess-A", "bob:sess-A"}.issubset(ids)
         finally:
             await store.aclose()
 

@@ -23,6 +23,8 @@ import aiosqlite
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from src.persistence.user_migration import migrate_legacy_thread_ids
+
 
 # 项目根/memory/ —— 与 skills/ teams/ 同级，独立目录
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -75,12 +77,23 @@ class LeaderStore:
         return store
 
     async def setup(self) -> None:
-        """打开 aiosqlite 连接并建表（幂等）。"""
+        """打开 aiosqlite 连接 + 建表 + 一次性迁移旧 thread_id（幂等）。"""
         if self._is_setup:
             return
         self._conn = await aiosqlite.connect(str(self._db_path))
         self._saver = AsyncSqliteSaver(self._conn)
         await self._saver.setup()
+        # 旧版（add-memory-persistence）的 thread_id 是裸 session_id，
+        # 加入 user_id 维度后改为 "{user_id}:{session_id}" 格式；
+        # 这里对历史数据做一次性幂等迁移：无冒号 → "default:<原值>"。
+        try:
+            affected = await migrate_legacy_thread_ids(self._conn)
+            if affected:
+                # 这里不引 log 模块以避免循环；调用方需要可观测的话由 CLI 启动日志兜底
+                print(f"[LeaderStore] 迁移 {affected} 行旧 thread_id → default:<原值>")
+        except Exception as e:
+            # 迁移失败不阻塞 setup —— 用户后续仍可正常使用，仅旧数据可能不可见
+            print(f"[LeaderStore] ⚠ 旧 thread_id 迁移失败：{type(e).__name__}: {e}")
         self._is_setup = True
 
     # ── 对外接口 ─────────────────────────────────────────────────────

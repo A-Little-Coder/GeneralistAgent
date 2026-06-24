@@ -1,16 +1,28 @@
 """
-SessionManager —— 维护 Leader 的多会话元数据，存储于 `memory/sessions.json`。
+SessionManager —— 多 user × 多 session 元数据管理，存于 `memory/sessions.json`。
 
-设计要点：
-  - 文件存储而非 SQLite —— 量级小（百级）、人类可读、易调试
-  - 原子写：`tempfile + os.replace`，避免崩溃中态
-  - 双向联动 LeaderStore：删除 session 时调 LeaderStore.purge 同步清 checkpoint
-  - 首启 bootstrap：sessions.json 不存在或空列表时自动建 session-1
-  - 标题策略：set_title_if_empty 取首条消息前 20 个 Unicode 字符；后续永不更新（用户可用 /title 改）
+数据模型（add-user-scope-to-memory）：
 
-非目标：
-  - 不实现并发多用户（单 CLI 进程模型）
-  - 不实现软删除 / 回收站（首版从简）
+    {
+      "users": {
+        "alice": {
+          "current": "session-2",
+          "sessions": [{id, title, created_at, last_active_at}, ...]
+        },
+        "default": { ... }
+      }
+    }
+
+SessionManager 持有 `current_user_id` 状态，所有公共方法（list / new / switch /
+delete / rename / set_title_if_empty / bootstrap）隐式作用于该 user。
+
+CLI 启动时 `input()` 拿到 user_id 后调 `switch_user(uid)`；运行中 `/user <uid>`
+也调同一接口。
+
+`current_user_id` **不持久化** —— 每次启动由 CLI 决定（避免"上次 alice，下次默认还是
+alice"的隐式行为）。
+
+迁移：检测旧格式（无 `users` 字段）→ 自动包到 `users.default` 并落盘。
 """
 
 from __future__ import annotations
@@ -23,14 +35,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
+from src.persistence.user_migration import (
+    empty_users_dict,
+    migrate_legacy_sessions_dict,
+)
+
 if TYPE_CHECKING:
     from src.persistence.leader_store import LeaderStore
 
 
-# 与 leader_store 同目录，但解耦：SessionManager 不强依赖 LeaderStore 存在
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MEMORY_DIR = _PROJECT_ROOT / "memory"
 DEFAULT_SESSIONS_FILENAME = "sessions.json"
+DEFAULT_USER_ID = "default"
 
 # 标题截取的字符数上限（中文按 Unicode 字符）
 _TITLE_MAX_CHARS = 20
@@ -55,7 +72,7 @@ def _next_session_id(existing_ids: set[str]) -> str:
 class Session:
     """单个会话的元数据。"""
     id: str
-    title: str = ""                  # 空字符串表示"未命名"，首条消息会自动填充
+    title: str = ""
     created_at: str = field(default_factory=_now_iso)
     last_active_at: str = field(default_factory=_now_iso)
 
@@ -72,25 +89,47 @@ class Session:
         )
 
 
+@dataclass
+class _UserBucket:
+    """单个 user 的 sessions 状态。"""
+    current: Optional[str] = None
+    sessions: list[Session] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "current": self.current,
+            "sessions": [s.to_dict() for s in self.sessions],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "_UserBucket":
+        sessions = [Session.from_dict(x) for x in d.get("sessions", []) if isinstance(x, dict)]
+        current = d.get("current") if d.get("current") in {s.id for s in sessions} else (
+            sessions[0].id if sessions else None
+        )
+        return cls(current=current, sessions=sessions)
+
+
 class SessionManager:
-    """Session CRUD + current 指针 + 与 LeaderStore 的删除联动。
+    """多 user × 多 session 元数据管理。
 
     用法：
-        sm = SessionManager()           # 默认 memory/sessions.json
-        sm.bootstrap()                  # 首启自动建 session-1
+        sm = SessionManager()
+        sm.switch_user("alice")            # 输入或运行时切换；首次会自动建桶
+        sm.bootstrap()                     # 当前 user 无 session 时自动建 session-1
         current = sm.get_current()
-        sm.set_title_if_empty(current.id, user_input)
-        sm.new()                        # /new
-        sm.list()                       # /sessions
-        sm.switch("session-2")          # /switch
-        sm.delete("session-2", leader_store=store)  # /delete
-        sm.rename("session-1", "Q1 销售")           # /title
+        sm.new() / sm.switch(id) / sm.rename(id, title)
+        await sm.delete(id, leader_store)  # 联动清 checkpoint，用复合 thread_id
+
+        # 拼 LangGraph thread_id（CLI 用这个传给 astream）
+        thread_id = sm.compose_thread_id(current.id)   # → "alice:session-2"
     """
 
     def __init__(
         self,
         file_path: Optional[Path] = None,
         memory_dir: Optional[Path] = None,
+        default_user_id: str = DEFAULT_USER_ID,
     ):
         if file_path is not None:
             self._file = Path(file_path)
@@ -99,39 +138,46 @@ class SessionManager:
             self._file = base / DEFAULT_SESSIONS_FILENAME
         self._file.parent.mkdir(parents=True, exist_ok=True)
 
-        self._sessions: list[Session] = []
-        self._current_id: Optional[str] = None
+        self._users: dict[str, _UserBucket] = {}
+        # current_user_id 不持久化；CLI 启动 input 决定，运行中 /user 修改
+        self._current_user_id: str = default_user_id
         self._load()
 
     # ── 持久化 ──────────────────────────────────────────────────────
 
     def _load(self) -> None:
-        """从磁盘加载；文件不存在/损坏视为空状态（待 bootstrap 创建）。"""
+        """从磁盘加载；检测旧格式自动迁移到 users.default 并落盘。"""
         if not self._file.exists():
             return
+
         try:
-            data = json.loads(self._file.read_text(encoding="utf-8"))
+            raw = json.loads(self._file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             # 文件损坏：保留磁盘原样，内存视为空；调用方应 bootstrap 重新建
             return
 
-        raw_sessions = data.get("sessions", [])
-        self._sessions = [Session.from_dict(d) for d in raw_sessions]
-        self._current_id = data.get("current")
-        # 校正 current：若指向不存在的 id，重置为第一个或 None
-        ids = {s.id for s in self._sessions}
-        if self._current_id not in ids:
-            self._current_id = self._sessions[0].id if self._sessions else None
+        data, migrated = migrate_legacy_sessions_dict(raw, default_user_id=DEFAULT_USER_ID)
+
+        users_raw = data.get("users", {})
+        if not isinstance(users_raw, dict):
+            users_raw = {}
+
+        self._users = {
+            uid: _UserBucket.from_dict(bucket if isinstance(bucket, dict) else {})
+            for uid, bucket in users_raw.items()
+        }
+
+        # 旧格式迁移完立即落盘，避免下次启动再迁
+        if migrated:
+            self._save()
 
     def _save(self) -> None:
         """原子写：tempfile + os.replace，避免半成品文件。"""
         payload = {
-            "current": self._current_id,
-            "sessions": [s.to_dict() for s in self._sessions],
+            "users": {uid: bucket.to_dict() for uid, bucket in self._users.items()},
         }
         data = json.dumps(payload, ensure_ascii=False, indent=2)
 
-        # 同目录下创建临时文件再 os.replace 保证原子性（跨盘 rename 不可靠）
         fd, tmp_path = tempfile.mkstemp(
             prefix=".sessions.", suffix=".json.tmp", dir=str(self._file.parent)
         )
@@ -140,96 +186,146 @@ class SessionManager:
                 f.write(data)
             os.replace(tmp_path, self._file)
         except OSError:
-            # 写失败时清理临时文件，让上层异常继续抛
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
             raise
 
+    # ── user 切换 ──────────────────────────────────────────────────
+
+    def switch_user(self, user_id: str) -> str:
+        """切换当前 user_id。新 user 自动建空桶（不 bootstrap session，由调用方决定）。
+
+        Args:
+            user_id: 目标 user_id；不允许含冒号
+
+        Returns:
+            生效的 user_id
+
+        Raises:
+            ValueError: user_id 含冒号
+        """
+        if ":" in user_id:
+            raise ValueError(f"user_id 不允许包含冒号: {user_id!r}")
+        if user_id.strip() == "":
+            raise ValueError("user_id 不能为空")
+
+        if user_id not in self._users:
+            self._users[user_id] = _UserBucket()
+            self._save()
+        self._current_user_id = user_id
+        return user_id
+
+    @property
+    def current_user_id(self) -> str:
+        return self._current_user_id
+
+    def users(self) -> list[str]:
+        """列出已存在的 user_id —— 仅调试用。"""
+        return list(self._users.keys())
+
+    def _bucket(self) -> _UserBucket:
+        """取当前 user 的桶；不存在时按 switch_user 语义建空桶。"""
+        if self._current_user_id not in self._users:
+            self._users[self._current_user_id] = _UserBucket()
+        return self._users[self._current_user_id]
+
     # ── 首启 ────────────────────────────────────────────────────────
 
     def bootstrap(self) -> Session:
-        """若没有任何 session，自动建 session-1 并设为 current。返回 current session。"""
-        if not self._sessions:
+        """若当前 user 无 session，自动建 session-1 并设为该 user 的 current。"""
+        bucket = self._bucket()
+        if not bucket.sessions:
             sess = Session(id="session-1")
-            self._sessions.append(sess)
-            self._current_id = sess.id
+            bucket.sessions.append(sess)
+            bucket.current = sess.id
             self._save()
-        elif self._current_id is None:
-            self._current_id = self._sessions[0].id
+        elif bucket.current is None:
+            bucket.current = bucket.sessions[0].id
             self._save()
         return self.get_current()  # type: ignore[return-value]
 
-    # ── 查询 ────────────────────────────────────────────────────────
+    # ── 查询（隐式作用于 current user）─────────────────────────────
 
     def list(self) -> list[Session]:
-        """返回所有 session 副本（按 created_at 升序）。"""
-        return list(self._sessions)
+        return list(self._bucket().sessions)
 
     def get(self, session_id: str) -> Optional[Session]:
-        for s in self._sessions:
+        for s in self._bucket().sessions:
             if s.id == session_id:
                 return s
         return None
 
     def get_current(self) -> Optional[Session]:
-        if self._current_id is None:
+        bucket = self._bucket()
+        if bucket.current is None:
             return None
-        return self.get(self._current_id)
+        return self.get(bucket.current)
 
     @property
     def current_id(self) -> Optional[str]:
-        return self._current_id
+        return self._bucket().current
 
-    # ── 变更 ────────────────────────────────────────────────────────
+    # ── 复合 thread_id ────────────────────────────────────────────
+
+    def compose_thread_id(self, session_id: str) -> str:
+        """拼成 LangGraph 用的 thread_id：`<current_user_id>:<session_id>`。
+
+        给 CLI 在 `agent.astream` / `LeaderStore.purge` 处使用。
+        """
+        return f"{self._current_user_id}:{session_id}"
+
+    # ── 变更（隐式作用于 current user）─────────────────────────────
 
     def new(self, title: str = "") -> Session:
-        """新建空 session 并切换为 current。"""
-        ids = {s.id for s in self._sessions}
+        """新建空 session 并切换为当前 user 的 current。"""
+        bucket = self._bucket()
+        ids = {s.id for s in bucket.sessions}
         sess = Session(id=_next_session_id(ids), title=title)
-        self._sessions.append(sess)
-        self._current_id = sess.id
+        bucket.sessions.append(sess)
+        bucket.current = sess.id
         self._save()
         return sess
 
     def switch(self, session_id: str) -> Session:
-        """切换 current session。session_id 不存在则抛 KeyError。"""
+        """切换当前 user 的 current session。"""
         target = self.get(session_id)
         if target is None:
-            raise KeyError(f"session '{session_id}' 不存在")
-        self._current_id = target.id
+            raise KeyError(f"session '{session_id}' 不存在于 user '{self._current_user_id}'")
+        bucket = self._bucket()
+        bucket.current = target.id
         target.last_active_at = _now_iso()
         self._save()
         return target
 
-    async def delete(self, session_id: str, leader_store: Optional["LeaderStore"] = None) -> Session:
-        """删除 session：联动清 checkpoint，若删的是 current 自动切到剩余首个或新建 session-1。
+    async def delete(
+        self,
+        session_id: str,
+        leader_store: Optional["LeaderStore"] = None,
+    ) -> Session:
+        """删除当前 user 的某 session，联动清复合 thread_id 的 checkpoint。
 
-        async：因为 LeaderStore.purge 是异步的（AsyncSqliteSaver.adelete_thread）。
-
-        Returns:
-            被删除的 Session 实例。
+        删除的若是 current → 自动切到剩余首个；若空则新建 session-1。
         """
         target = self.get(session_id)
         if target is None:
-            raise KeyError(f"session '{session_id}' 不存在")
+            raise KeyError(f"session '{session_id}' 不存在于 user '{self._current_user_id}'")
 
-        # 先清 checkpoint —— 若清失败抛异常，sessions.json 保持原样
         if leader_store is not None:
-            await leader_store.purge(session_id)
+            # 用复合 thread_id 清 —— add-user-scope-to-memory 后正确做法
+            await leader_store.purge(self.compose_thread_id(session_id))
 
-        self._sessions = [s for s in self._sessions if s.id != session_id]
+        bucket = self._bucket()
+        bucket.sessions = [s for s in bucket.sessions if s.id != session_id]
 
-        # current 联动：如果删的就是 current
-        if self._current_id == session_id:
-            if self._sessions:
-                self._current_id = self._sessions[0].id
+        if bucket.current == session_id:
+            if bucket.sessions:
+                bucket.current = bucket.sessions[0].id
             else:
-                # 没了 —— 自动建 session-1
                 new_sess = Session(id="session-1")
-                self._sessions.append(new_sess)
-                self._current_id = new_sess.id
+                bucket.sessions.append(new_sess)
+                bucket.current = new_sess.id
 
         self._save()
         return target
@@ -238,23 +334,16 @@ class SessionManager:
         """改标题（用户主动 /title，强制覆盖）。"""
         target = self.get(session_id)
         if target is None:
-            raise KeyError(f"session '{session_id}' 不存在")
+            raise KeyError(f"session '{session_id}' 不存在于 user '{self._current_user_id}'")
         target.title = new_title.strip()
         self._save()
         return target
 
     def set_title_if_empty(self, session_id: str, user_input: str) -> Session:
-        """自动取标题：仅当 title 为空时基于 user_input 前 20 字生成。
-
-        规则：
-          - strip 后取前 20 个 Unicode 字符
-          - 原文超过 20 字符则末尾追加 …
-
-        非空时不动；同时刷新 last_active_at。
-        """
+        """自动取标题：仅当 title 为空时基于 user_input 前 20 字生成。"""
         target = self.get(session_id)
         if target is None:
-            raise KeyError(f"session '{session_id}' 不存在")
+            raise KeyError(f"session '{session_id}' 不存在于 user '{self._current_user_id}'")
 
         target.last_active_at = _now_iso()
 
@@ -271,7 +360,7 @@ class SessionManager:
         """刷新 last_active_at（不动 title）。"""
         target = self.get(session_id)
         if target is None:
-            raise KeyError(f"session '{session_id}' 不存在")
+            raise KeyError(f"session '{session_id}' 不存在于 user '{self._current_user_id}'")
         target.last_active_at = _now_iso()
         self._save()
         return target

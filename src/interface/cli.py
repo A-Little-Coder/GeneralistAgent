@@ -1,17 +1,17 @@
 """
-CLI 交互模块 — 异步流式渲染、多会话切换与用户交互主循环。
+CLI 交互模块 — 异步流式渲染、多用户/多会话切换与用户交互主循环。
 
-设计要点（add-memory-persistence）：
-  - **持久化**：Leader 使用 `LeaderStore`(SqliteSaver) 跨进程保留对话历史；
-    `thread_id = session_id`，由 `SessionManager` 维护多会话切换。
+设计要点：
+  - **user 维度**（add-user-scope-to-memory）：启动 input 读 user_id；
+    `thread_id = "{user_id}:{session_id}"`；`/user <uid>` 运行时切换 user
+  - **持久化**（add-memory-persistence）：Leader 用 `LeaderStore`(AsyncSqliteSaver)
+    跨进程保留对话历史，由 `SessionManager` 维护多 user × 多 session
   - **不再 rebuild_state**：每轮只把新消息 `[HumanMessage(user_input)]` 喂给
-    `agent.astream`，历史由 checkpointer 自动加载与写回。
-  - **流式渲染**：保留 messages 模式逐 token 输出 + updates 模式工具返回预览，
-    但渲染器不再维护"重建用"的消息列表。
-  - **Session 命令**：`/new` `/sessions` `/switch` `/delete` `/title` `/help`，
-    在 `_repl_loop` 入口识别 `/` 前缀路由。
-  - **Teammate 焚毁**：每轮 finally 调 `team_manager.cleanup_spawned_in_turn()`，
-    本轮新建的 Teammate 在请求结束时立刻销毁（X2 记忆）。
+    `agent.astream`，历史由 checkpointer 自动加载与写回
+  - **流式渲染**：messages 模式逐 token + updates 模式工具返回预览
+  - **Session 命令**：`/new` `/sessions` `/switch` `/delete` `/title` `/user` `/help`
+  - **Teammate 焚毁**：每轮 finally + `/user` 切换前都调
+    `team_manager.cleanup_spawned_in_turn()`
 """
 
 import asyncio
@@ -28,11 +28,11 @@ from src.interface import log
 from src.orchestration.team import TeamManager
 from src.orchestration.tools import OrchestrationContext, build_orchestration_tools
 from src.persistence import LeaderStore, SessionManager
+from src.persistence.session_manager import DEFAULT_USER_ID
 from src.skills.center import SkillCenter
 
 
 # Windows 终端默认 GBK 无法显示 emoji（🛠 📥 等）—— 模块导入时即强制 UTF-8
-# 覆盖所有走流式渲染的代码路径（REPL / Runner / ad-hoc 调用）
 def _ensure_utf8_stdout() -> None:
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
@@ -83,9 +83,7 @@ _SYSTEM_PROMPT = """你是一个智能助手（团队 Leader）。
   等待任务请用 wait_for_message，不要用 execute 调 sleep/wait。
 - task_list_query 仅作为兜底排查使用，不要循环轮询。"""
 
-# 流式渲染时单条工具返回内容的截断长度
 _TOOL_RETURN_PREVIEW = 300
-# 流式渲染时工具调用参数的截断长度
 _TOOL_ARGS_PREVIEW = 200
 
 
@@ -93,14 +91,9 @@ _TOOL_ARGS_PREVIEW = 200
 
 
 class StreamRenderer:
-    """流式事件渲染器 —— 仅负责打印，不再维护"重建用"的消息列表。
-
-    add-memory-persistence：删除了 collected_messages / collected_state，
-    历史由 SqliteSaver 按 thread_id 自动加载与写回。
-    """
+    """流式事件渲染器 —— 仅负责打印，不维护"重建用"的消息列表。"""
 
     def __init__(self) -> None:
-        # 已打印过工具名的 (node, tool_name) 集合，避免重复打印
         self._printed_tools: set[tuple[str, str]] = set()
 
     def handle(self, mode: str, data: Any) -> None:
@@ -108,8 +101,6 @@ class StreamRenderer:
             self._handle_messages(data)
         elif mode == "updates":
             self._handle_updates(data)
-
-    # ── messages 模式：token 级渲染 ──────────────────────────────────
 
     def _handle_messages(self, data: Any) -> None:
         chunk, metadata = data
@@ -130,8 +121,6 @@ class StreamRenderer:
                 if args:
                     log.leader_log(f"   参数: {args[:_TOOL_ARGS_PREVIEW]}")
 
-    # ── updates 模式：工具返回预览（不再收集状态） ────────────────────
-
     def _handle_updates(self, data: Any) -> None:
         for _node, update in (data or {}).items():
             if not isinstance(update, dict):
@@ -146,14 +135,15 @@ class StreamRenderer:
                     log.leader_log(f"📥 工具返回: {preview}")
 
 
-async def _run_turn(agent, user_input: str, session_id: str) -> None:
+async def _run_turn(agent, user_input: str, thread_id: str) -> None:
     """执行单轮流式请求。
 
-    历史由 checkpointer 按 thread_id=session_id 自动加载；本函数仅推送新消息。
+    历史由 checkpointer 按 thread_id 自动加载；本函数仅推送新消息。
+    thread_id 现为复合形式 `{user_id}:{session_id}`，由 SessionManager.compose_thread_id 拼。
     """
     renderer = StreamRenderer()
     state = {"messages": [HumanMessage(content=user_input)]}
-    invoke_config = {"configurable": {"thread_id": session_id}}
+    invoke_config = {"configurable": {"thread_id": thread_id}}
     async for mode, data in agent.astream(
         state, config=invoke_config, stream_mode=["messages", "updates"]
     ):
@@ -171,6 +161,7 @@ _COMMAND_HELP = """
   /switch <序号|id>    切换到指定会话
   /delete <序号|id>    删除会话（需确认；会同步清掉历史）
   /title <新标题>      重命名当前会话
+  /user <user_id>      切换当前 user（独立的 sessions 空间）
   /help  /?            显示本帮助
   exit / quit / q      退出程序
 """
@@ -182,14 +173,12 @@ def _resolve_session(sm: SessionManager, ref: str):
     if not ref:
         return None
     sessions = sm.list()
-    # 先尝试当序号
     try:
         idx = int(ref)
         if 1 <= idx <= len(sessions):
             return sessions[idx - 1]
     except ValueError:
         pass
-    # 当 id
     return sm.get(ref)
 
 
@@ -212,10 +201,31 @@ async def _ainput(prompt: str) -> str:
     return await asyncio.get_event_loop().run_in_executor(None, lambda: input(prompt))
 
 
+async def _prompt_user_id() -> str:
+    """启动时读 user_id：回车默认 'default'；含冒号拒绝重输；Ctrl+C/EOF 直接退出进程。
+
+    add-user-scope-to-memory D1：CLI 启动唯一入口。
+    """
+    while True:
+        try:
+            raw = (await _ainput("请输入 user_id (回车默认 default): ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消启动")
+            sys.exit(0)
+
+        if raw == "":
+            return DEFAULT_USER_ID
+        if ":" in raw:
+            print("✗ user_id 不允许包含冒号，请重新输入")
+            continue
+        return raw
+
+
 async def _handle_command(
     line: str,
     sm: SessionManager,
     store: LeaderStore,
+    team_manager: Optional[TeamManager] = None,
 ) -> bool:
     """处理 `/...` 命令；返回 True 表示已处理（无需走 agent 推理）。"""
     parts = line.strip().split(maxsplit=1)
@@ -274,7 +284,33 @@ async def _handle_command(
         print(f"✓ 已重命名 {current.id} → {arg}")
         return True
 
-    # 未知命令
+    if cmd == "/user":
+        if not arg or ":" in arg:
+            print("用法：/user <user_id>（不允许包含冒号）")
+            return True
+        # 切 user 前先焚毁本轮已 spawn 的 Teammate —— 避免跨 user 串台
+        if team_manager is not None:
+            try:
+                cleaned = await team_manager.cleanup_spawned_in_turn()
+                if cleaned:
+                    log.indent_log(f"/user 切换前 cleanup ✓ 清理 {cleaned} 个 Teammate")
+            except Exception as e:
+                log.indent_log(f"/user 切换前 cleanup ✗ {type(e).__name__}: {e}")
+
+        try:
+            new_uid = sm.switch_user(arg)
+        except ValueError as e:
+            print(f"✗ {e}")
+            return True
+        # 新 user 若无 session 自动 bootstrap
+        sm.bootstrap()
+        current = sm.get_current()
+        print(
+            f"\n✓ 切换到 user '{new_uid}'；"
+            f"当前会话 {current.id}  {current.title or '(未命名)'}"
+        )
+        return True
+
     print(f"未知命令: {cmd}；输入 /help 查看可用命令")
     return True
 
@@ -289,18 +325,24 @@ async def repl(
 ) -> None:
     """异步交互式主循环。
 
-    每轮：
-      1. SkillCenter 检测技能变更
-      2. 重新实例化 Leader Agent（注入 SqliteSaver checkpointer）
-      3. agent.astream 流式处理；历史由 checkpointer 自动加载
-      4. 流式结束后 cleanup_spawned_in_turn 焚毁本轮 Teammate
+    流程：
+      1. 打印 banner
+      2. 启动 LeaderStore（含旧 thread_id 迁移）
+      3. input 读 user_id，绑定到 SessionManager
+      4. 进入 _repl_loop，每轮处理 user 输入
+      5. 退出前 cleanup_all + LeaderStore.aclose
     """
     print(_BANNER)
 
     # ── 持久化层 ─────────────────────────────────────────────────────
     store = await LeaderStore.create()
     sm = SessionManager()
+
+    # ── 启动绑定 user_id ─────────────────────────────────────────────
+    user_id = await _prompt_user_id()
+    sm.switch_user(user_id)
     current = sm.bootstrap()
+    print(f"当前 user: {user_id}")
     print(f"当前会话：{current.id}  {current.title or '(未命名)'}")
 
     # ── 编排基础设施 ─────────────────────────────────────────────────
@@ -326,7 +368,6 @@ async def repl(
             orchestration_tools=orchestration_tools,
         )
     finally:
-        # 退出时清理：所有团队 + leader 持久化
         if config:
             try:
                 await team_manager.cleanup_all()
@@ -348,7 +389,7 @@ async def _repl_loop(
 ) -> None:
     while True:
         current = sm.get_current()
-        prompt_label = current.id if current else "?"
+        prompt_label = f"{sm.current_user_id}/{current.id}" if current else f"{sm.current_user_id}/?"
         try:
             user_input = (await _ainput(f"\n[{prompt_label}] 你 > ")).strip()
         except (EOFError, KeyboardInterrupt):
@@ -364,11 +405,11 @@ async def _repl_loop(
 
         # 命令路由
         if user_input.startswith("/"):
-            await _handle_command(user_input, sm, store)
+            await _handle_command(user_input, sm, store, team_manager=team_manager)
             continue
 
         # 1. 技能变更检测（SkillCenter）
-        _ = skill_center.decorate_state({})  # 仅触发同步，不再依赖返回值挂 state
+        _ = skill_center.decorate_state({})
 
         # 2. 标题自动填充（仅 title 为空时）
         if current is not None:
@@ -383,9 +424,10 @@ async def _repl_loop(
             checkpointer=store.get_checkpointer(),
         )
 
-        # 4. 流式推理（历史由 checkpointer 自动加载）
+        # 4. 流式推理（thread_id 用复合形式：user_id:session_id）
+        thread_id = sm.compose_thread_id(current.id) if current else f"{sm.current_user_id}:default"
         try:
-            await _run_turn(agent, user_input, current.id if current else "default")
+            await _run_turn(agent, user_input, thread_id)
         finally:
             # 5. 每轮焚毁本轮新建的 Teammate（X2 语义）
             try:

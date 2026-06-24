@@ -137,12 +137,14 @@ class TestDelete:
         store = await LeaderStore.create(memory_dir=tmp_path)
         try:
             sm = SessionManager(memory_dir=tmp_path)
+            sm.switch_user("default")
             sm.bootstrap()
             s2 = sm.new()
-            # 写一个假 checkpoint 给 s2
+            # 写一个假 checkpoint 给 s2（用复合 thread_id：default:session-2）
+            composed = sm.compose_thread_id(s2.id)
             saver = store.get_checkpointer()
             await saver.aput(
-                {"configurable": {"thread_id": s2.id, "checkpoint_ns": ""}},
+                {"configurable": {"thread_id": composed, "checkpoint_ns": ""}},
                 {
                     "v": 4, "id": "c1", "ts": "2026-06-23T00:00:00Z",
                     "channel_values": {}, "channel_versions": {},
@@ -151,10 +153,11 @@ class TestDelete:
                 {"source": "test", "step": 1, "parents": {}},
                 {},
             )
-            assert s2.id in await store.list_thread_ids()
+            assert composed in await store.list_thread_ids()
 
+            # sm.delete 内部应该用 compose_thread_id 去清
             await sm.delete(s2.id, leader_store=store)
-            assert s2.id not in await store.list_thread_ids()
+            assert composed not in await store.list_thread_ids()
         finally:
             await store.aclose()
 
